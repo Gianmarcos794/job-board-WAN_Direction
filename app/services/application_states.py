@@ -15,7 +15,7 @@ Lifecycle::
 
 from __future__ import annotations
 
-from abc import ABC
+from abc import ABC, abstractmethod
 from typing import Any, Protocol
 
 
@@ -45,9 +45,15 @@ class IllegalTransitionError(Exception):
 
 
 class ApplicationState(ABC):
-    """Base state: every action is illegal unless a subclass overrides it."""
+    """Base state: every action is illegal unless a subclass overrides it.
 
-    name: str = ""
+    Abstract: each concrete state must set ``name`` (its stored status).
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """The status string stored on the Application row."""
 
     def allowed_actions(self) -> list[str]:
         """Actions this state overrides (i.e. the legal moves)."""
