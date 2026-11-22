@@ -59,9 +59,15 @@ class PreferenceBody(BaseModel):
 def checked(result: dict[str, Any]) -> dict[str, Any]:
     """Turn a service failure into the HTTP error code it carries."""
     if not result.get("ok"):
-        raise HTTPException(
-            status_code=result.get("status_code", 400), detail=result.get("error")
-        )
+        detail: dict[str, Any] | str = result.get("error", "request failed")
+        extra = {
+            key: value
+            for key, value in result.items()
+            if key not in {"ok", "status_code", "error"}
+        }
+        if extra:
+            detail = {"error": detail, **extra}
+        raise HTTPException(status_code=result.get("status_code", 400), detail=detail)
     return result
 
 
