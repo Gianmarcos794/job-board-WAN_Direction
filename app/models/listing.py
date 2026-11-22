@@ -13,3 +13,5 @@ class Listing(SQLModel, table=True):
     external_url: Optional[str] = None
     deadline: str
     status: str
+    # Admin's note when rejecting a pending listing (FR12); cleared on resubmit.
+    rejection_reason: Optional[str] = None
