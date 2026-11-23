@@ -207,6 +207,27 @@ def test_application_rejection_requires_a_reviewed_or_shortlisted_state():
     assert reviewed.rejection_reason == "No fit"
 
 
+def test_shortlisted_application_can_be_rejected_with_reason():
+    employer = Employer(
+        User(
+            id=10,
+            username="owner",
+            email="owner@example.com",
+            password="hashed",
+            role="employer",
+        )
+    )
+    application = _lifecycle_context(status="reviewed")
+    employer.shortlist_application(application)
+
+    employer.reject_application(application, "Position no longer available")
+
+    assert application.status == "rejected"
+    assert application.rejection_reason == "Position no longer available"
+    assert application.history[-1].old_status == "shortlisted"
+    assert application.history[-1].new_status == "rejected"
+
+
 def test_application_lifecycle_blocks_employer_who_does_not_own_listing():
     application = _lifecycle_context(owner_id=10)
     other_employer = Employer(
