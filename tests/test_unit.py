@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 import jwt
@@ -8,9 +9,25 @@ from app.models.listing import Listing
 from app.models.user import User
 from app.services.application_states import IllegalTransitionError
 from app.services.auth_service import AuthService
+from app.services.board_auth import public_user
+from app.services.email import EmailMessage
 from app.services.employer import Employer
 from app.services.errors import ForbiddenError
 from app.services.job_application import JobApplication
+from app.services.listings import (
+    _validate_listing_fields,
+    check_eligible_graduate,
+    is_eligible,
+    is_open,
+)
+from app.services.notifications import (
+    APPLICATION_STATUS,
+    NEW_LISTING,
+    ApplicantNotifier,
+    deliver_emails,
+    status_message,
+    wants_email,
+)
 from app.utilities.security import encrypt_password, verify_password
 
 
@@ -206,3 +223,267 @@ def test_application_lifecycle_blocks_employer_who_does_not_own_listing():
         other_employer.review_application(application)
 
     assert application.status == "submitted"
+
+
+# ---------------------------------------------------------------------------
+# Authentication unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_public_user_strips_password_fields_from_model_and_dict():
+    user = User(
+        id=5,
+        username="grad",
+        email="grad@example.com",
+        password=encrypt_password("secret"),
+        role="graduate",
+        programme="DCIT",
+    )
+
+    from_model = public_user(user)
+    assert from_model is not None
+    assert "password" not in from_model
+    assert "password_hash" not in from_model
+    assert from_model["email"] == "grad@example.com"
+
+    from_dict = public_user(
+        {
+            "id": 5,
+            "email": "grad@example.com",
+            "password": "secret",
+            "password_hash": "hash",
+        }
+    )
+    assert from_dict == {"id": 5, "email": "grad@example.com"}
+    assert public_user(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Listings unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_eligible_and_check_eligible_graduate():
+    dcit_grad = {"id": 1, "role": "graduate", "programme": "DCIT"}
+    other_grad = {"id": 2, "role": "graduate", "programme": "OTHER"}
+    employer = {"id": 3, "role": "employer", "programme": None}
+    admin = {"id": 4, "role": "admin", "programme": None}
+
+    assert is_eligible(dcit_grad) is True
+    assert check_eligible_graduate(dcit_grad) is None
+
+    assert is_eligible(other_grad) is False
+    other_err = check_eligible_graduate(other_grad)
+    assert other_err is not None and other_err["status_code"] == 403
+
+    assert is_eligible(employer) is False
+    emp_err = check_eligible_graduate(employer)
+    assert emp_err is not None and emp_err["status_code"] == 403
+
+    assert is_eligible(admin) is False
+    admin_err = check_eligible_graduate(admin)
+    assert admin_err is not None and admin_err["status_code"] == 403
+
+    assert is_eligible(None) is False
+    none_err = check_eligible_graduate(None)
+    assert none_err is not None and none_err["status_code"] == 404
+
+
+def test_is_open_checks_published_status_and_deadline():
+    today = date.today()
+    future = (today + timedelta(days=5)).isoformat()
+    past = (today - timedelta(days=1)).isoformat()
+
+    def make_listing(status: str, deadline: str) -> Listing:
+        return Listing(
+            employer_id=1,
+            title="Role",
+            company="Co",
+            description="Desc",
+            apply_mode="collect",
+            deadline=deadline,
+            status=status,
+        )
+
+    assert is_open(make_listing("published", future)) is True
+    assert is_open(make_listing("published", today.isoformat())) is True
+    assert is_open(make_listing("published", past)) is False
+    for non_published in ("pending", "rejected", "unpublished", "filled"):
+        assert is_open(make_listing(non_published, future)) is False
+
+
+def test_validate_listing_fields():
+    assert _validate_listing_fields("collect", "2099-12-31", None) is None
+    assert (
+        _validate_listing_fields("external", "2099-12-31", "https://example.com/apply")
+        is None
+    )
+
+    bad_mode = _validate_listing_fields("email", "2099-12-31", None)
+    assert bad_mode is not None and bad_mode["status_code"] == 400
+
+    missing_url = _validate_listing_fields("external", "2099-12-31", None)
+    assert missing_url is not None and missing_url["status_code"] == 400
+
+    bad_date = _validate_listing_fields("collect", "31-12-2099", None)
+    assert bad_date is not None and bad_date["status_code"] == 400
+
+
+# ---------------------------------------------------------------------------
+# Notifications unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_status_message_includes_rejection_reason_only_when_rejected():
+    listing = Listing(
+        id=1,
+        employer_id=10,
+        title="Backend Dev",
+        company="Acme",
+        description="Build APIs",
+        apply_mode="collect",
+        deadline="2099-12-31",
+        status="published",
+    )
+    reviewed = Application(
+        id=1,
+        listing_id=1,
+        graduate_id=20,
+        cover_letter="Hi",
+        resume_text="CV",
+        status="reviewed",
+        rejection_reason="ignored",
+    )
+    rejected_with_reason = Application(
+        id=2,
+        listing_id=1,
+        graduate_id=20,
+        cover_letter="Hi",
+        resume_text="CV",
+        status="rejected",
+        rejection_reason="Missing Python experience",
+    )
+    rejected_without_reason = Application(
+        id=3,
+        listing_id=1,
+        graduate_id=20,
+        cover_letter="Hi",
+        resume_text="CV",
+        status="rejected",
+        rejection_reason=None,
+    )
+
+    msg_reviewed = status_message(listing, reviewed)
+    assert "Backend Dev" in msg_reviewed and "reviewed" in msg_reviewed
+    assert "Reason:" not in msg_reviewed
+
+    msg_rejected = status_message(listing, rejected_with_reason)
+    assert "rejected" in msg_rejected
+    assert "Reason: Missing Python experience" in msg_rejected
+
+    msg_rejected_plain = status_message(listing, rejected_without_reason)
+    assert "rejected" in msg_rejected_plain
+    assert "Reason:" not in msg_rejected_plain
+
+
+def test_wants_email_defaults_to_true_and_respects_preference():
+    class FakePrefs:
+        def __init__(self, prefs):
+            self._prefs = prefs
+
+        def get(self, user_id, kind):
+            return self._prefs.get((user_id, kind))
+
+    prefs = FakePrefs(
+        {
+            (1, APPLICATION_STATUS): SimpleNamespace(email=False),
+            (1, NEW_LISTING): SimpleNamespace(email=True),
+        }
+    )
+
+    assert wants_email(prefs, 1, APPLICATION_STATUS) is False
+    assert wants_email(prefs, 1, NEW_LISTING) is True
+    assert wants_email(prefs, 2, APPLICATION_STATUS) is True
+
+
+def test_deliver_emails_skips_none_and_isolates_failures():
+    sent = []
+
+    class FlakySender:
+        def send(self, message):
+            if message.to == "fail@example.com":
+                raise RuntimeError("SMTP down")
+            sent.append(message.to)
+
+    deliver_emails(
+        [
+            None,
+            EmailMessage(to="first@example.com", subject="s1", body="b1"),
+            EmailMessage(to="fail@example.com", subject="s2", body="b2"),
+            EmailMessage(to="second@example.com", subject="s3", body="b3"),
+        ],
+        sender=FlakySender(),
+    )
+
+    assert sent == ["first@example.com", "second@example.com"]
+
+
+def test_applicant_notifier_stages_in_app_and_respects_email_preference():
+    saved_notifications = []
+
+    class FakeNotificationRepo:
+        db = None
+
+        def add(self, notification):
+            saved_notifications.append(notification)
+            return notification
+
+    class FakePrefs:
+        def __init__(self, email_enabled: bool):
+            self.email_enabled = email_enabled
+
+        def get(self, user_id, kind):
+            return SimpleNamespace(email=self.email_enabled)
+
+    applicant = User(
+        id=20,
+        username="grad",
+        email="grad@example.com",
+        password="hash",
+        role="graduate",
+        programme="DCIT",
+    )
+    listing = Listing(
+        id=1,
+        employer_id=10,
+        title="Data Engineer",
+        company="DataCo",
+        description="ETL",
+        apply_mode="collect",
+        deadline="2099-12-31",
+        status="published",
+    )
+    application = Application(
+        id=30,
+        listing_id=1,
+        graduate_id=20,
+        cover_letter="Hi",
+        resume_text="CV",
+        status="shortlisted",
+    )
+
+    notifier_on = ApplicantNotifier(FakeNotificationRepo(), preferences=FakePrefs(True))
+    email_on = notifier_on.stage_status_change(applicant, application, listing)
+    assert email_on is not None
+    assert email_on.to == "grad@example.com"
+    assert "Data Engineer" in email_on.subject
+    assert len(saved_notifications) == 1
+    assert saved_notifications[0].kind == APPLICATION_STATUS
+    assert saved_notifications[0].application_id == 30
+
+    notifier_off = ApplicantNotifier(
+        FakeNotificationRepo(), preferences=FakePrefs(False)
+    )
+    email_off = notifier_off.stage_status_change(applicant, application, listing)
+    assert email_off is None
+    assert len(saved_notifications) == 2
