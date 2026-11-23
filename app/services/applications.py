@@ -60,6 +60,15 @@ def apply(
             result["external_url"] = listing.external_url
             return result
 
+        existing = session.exec(
+            select(Application).where(
+                Application.graduate_id == graduate_id,
+                Application.listing_id == listing_id,
+            )
+        ).first()
+        if existing is not None:
+            return _fail(409, "application already submitted for this listing")
+
         resume = resume_text or user.get("resume_text") or ""
         application = Application(
             listing_id=listing_id,
